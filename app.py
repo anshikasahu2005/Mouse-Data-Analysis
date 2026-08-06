@@ -21,6 +21,11 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
 
 st.set_page_config(page_title="Multi-Mouse Behavioral Dashboard", layout="wide",
                     initial_sidebar_state="expanded")
@@ -469,6 +474,162 @@ def render_comparative(subjects):
 
 
 # ============================================================================
+#  CHATBOT HELPERS
+# ============================================================================
+OLLAMA_MODEL = "qwen3.5:4b"
+
+
+def build_system_prompt(context_text: str) -> str:
+    return (
+        "You are an expert neuroscience data analyst assistant embedded in a "
+        "Multi-Mouse Behavioral Dashboard. You help researchers understand mouse "
+        "behavioral experiment data including trial outcomes, lick latency, "
+        "calcium imaging (dF/F), learning curves, and signal-detection metrics "
+        "(hit rate, false-alarm rate, d-prime, criterion).\n\n"
+        "Current dashboard context:\n"
+        f"{context_text}\n\n"
+        "Answer concisely and accurately. If asked to compare mice or sessions, "
+        "refer to the context above. If data is not available say so clearly."
+    )
+
+
+def get_data_context(subject_choice, subjects):
+    """Build a short textual summary of the currently-viewed data for the LLM."""
+    lines = [f"Dashboard is showing: {subject_choice}"]
+    lines.append(f"All available subjects: {', '.join(subjects)}")
+    if subject_choice != COMPARE_LABEL:
+        try:
+            _, _, _, _, _, summary = load_subject(subject_choice)
+            lines.append(f"Number of sessions: {len(summary)}")
+            lines.append(f"Total trials: {int(summary.n_trials.sum()):,}")
+            if summary.accuracy.notna().any():
+                lines.append(f"Mean accuracy: {summary.accuracy.mean()*100:.1f}%")
+                lines.append(f"Best accuracy: {summary.accuracy.max()*100:.1f}%")
+            if summary.dprime.notna().any():
+                lines.append(f"Mean d-prime: {summary.dprime.mean():.2f}")
+                lines.append(f"Best d-prime: {summary.dprime.max():.2f}")
+            if summary.hit_rate.notna().any():
+                lines.append(f"Mean hit rate: {summary.hit_rate.mean()*100:.1f}%")
+                lines.append(f"Mean FA rate: {summary.fa_rate.mean()*100:.1f}%")
+            lines.append(f"Session IDs: {', '.join(summary.session.tolist())}")
+            lines.append(f"Has calcium imaging: {has_imaging(subject_choice)}")
+        except Exception as e:
+            lines.append(f"(Could not load subject data: {e})")
+    else:
+        try:
+            all_summary = load_all_summaries(tuple(subjects))
+            for s in subjects:
+                sub = all_summary[all_summary.subject == s]
+                acc = f"{sub.accuracy.mean()*100:.1f}%" if sub.accuracy.notna().any() else "N/A"
+                dp = f"{sub.dprime.max():.2f}" if sub.dprime.notna().any() else "N/A"
+                lines.append(f"  {s}: {sub.shape[0]} sessions, mean accuracy={acc}, best d'={dp}")
+        except Exception as e:
+            lines.append(f"(Could not load comparative data: {e})")
+    return "\n".join(lines)
+
+
+def render_chatbot_sidebar(subject_choice, subjects):
+    """Render the AI Assistant chat panel in the sidebar."""
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🤖 AI Assistant (Qwen)", expanded=st.session_state.get("chat_open", False)):
+        if not OLLAMA_AVAILABLE:
+            st.error("Install the `ollama` Python package: `pip install ollama`")
+            return
+
+        # --- initialise session state ---
+        if "chat_messages" not in st.session_state:
+            st.session_state.chat_messages = []
+        if "chat_thinking" not in st.session_state:
+            st.session_state.chat_thinking = False
+
+        # --- render chat history ---
+        chat_container = st.container(height=320)
+        with chat_container:
+            if not st.session_state.chat_messages:
+                st.markdown(
+                    "<div style='color:#888;font-size:0.85em;text-align:center;padding:12px 0;'>"
+                    "👋 Ask me anything about this mouse data!<br>"
+                    "<i>e.g. 'What was the best d-prime?' or 'Explain hit rate vs FA rate'</i>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            for msg in st.session_state.chat_messages:
+                role_icon = "🧑" if msg["role"] == "user" else "🤖"
+                with st.chat_message(msg["role"], avatar=role_icon):
+                    st.markdown(msg["content"])
+
+        # --- quick-action chips ---
+        col1, col2 = st.columns(2)
+        quick_prompts = [
+            ("📊 Summarize data", "Summarize the current mouse data for me."),
+            ("🏆 Best session?", "Which session had the best performance?"),
+            ("📈 Learning trend", "Describe the learning trend across sessions."),
+            ("❓ Explain d-prime", "What is d-prime and how do I interpret it?"),
+        ]
+        for i, (label, prompt) in enumerate(quick_prompts):
+            col = col1 if i % 2 == 0 else col2
+            if col.button(label, key=f"quick_{i}", use_container_width=True,
+                          disabled=st.session_state.chat_thinking):
+                st.session_state._pending_chat = prompt
+                st.rerun()
+
+        # --- text input ---
+        user_input = st.chat_input(
+            "Ask about the data…",
+            key="chat_input",
+            disabled=st.session_state.chat_thinking,
+        )
+
+        # Merge quick-chip input
+        pending = st.session_state.pop("_pending_chat", None)
+        if pending:
+            user_input = pending
+
+        # --- send message & stream response ---
+        if user_input:
+            st.session_state.chat_open = True
+            st.session_state.chat_thinking = True
+            st.session_state.chat_messages.append({"role": "user", "content": user_input})
+
+            context_text = get_data_context(subject_choice, subjects)
+            system_prompt = build_system_prompt(context_text)
+
+            messages_for_ollama = [
+                {"role": "system", "content": system_prompt},
+            ] + st.session_state.chat_messages
+
+            with chat_container:
+                with st.chat_message("assistant", avatar="🤖"):
+                    response_placeholder = st.empty()
+                    full_response = ""
+                    try:
+                        stream = ollama.chat(
+                            model=OLLAMA_MODEL,
+                            messages=messages_for_ollama,
+                            stream=True,
+                        )
+                        for chunk in stream:
+                            delta = chunk["message"]["content"]
+                            full_response += delta
+                            response_placeholder.markdown(full_response + "▌")
+                        response_placeholder.markdown(full_response)
+                    except Exception as e:
+                        full_response = f"⚠️ Error talking to Ollama: `{e}`\n\nMake sure Ollama is running and the model `{OLLAMA_MODEL}` is available (`ollama pull {OLLAMA_MODEL}`)."
+                        response_placeholder.error(full_response)
+
+            st.session_state.chat_messages.append({"role": "assistant", "content": full_response})
+            st.session_state.chat_thinking = False
+            st.rerun()
+
+        # --- clear button ---
+        if st.session_state.chat_messages:
+            if st.button("🗑️ Clear chat", key="clear_chat", use_container_width=True):
+                st.session_state.chat_messages = []
+                st.session_state.chat_thinking = False
+                st.rerun()
+
+
+# ============================================================================
 #  MAIN
 # ============================================================================
 subjects = discover_subjects()
@@ -484,3 +645,6 @@ if subject_choice == COMPARE_LABEL:
     render_comparative(subjects)
 else:
     render_subject(subject_choice)
+
+# Render chatbot at the bottom of the sidebar (always visible)
+render_chatbot_sidebar(subject_choice, subjects)
