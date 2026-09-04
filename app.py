@@ -476,7 +476,23 @@ def render_comparative(subjects):
 # ============================================================================
 #  CHATBOT HELPERS
 # ============================================================================
-OLLAMA_MODEL = "qwen3.5:4b"
+DEFAULT_MODELS = ["qwen3.5:4b", "llama3.2:3b", "gemma3:1b"]
+
+
+def get_available_models():
+    """Fetch installed local models from Ollama, ensuring default models are included."""
+    models = list(DEFAULT_MODELS)
+    if OLLAMA_AVAILABLE:
+        try:
+            res = ollama.list()
+            models_list = res.get("models", []) if isinstance(res, dict) else getattr(res, "models", [])
+            for item in models_list:
+                m_name = item.get("name") or item.get("model") if isinstance(item, dict) else getattr(item, "model", getattr(item, "name", None))
+                if m_name and m_name not in models:
+                    models.append(m_name)
+        except Exception:
+            pass
+    return models
 
 
 def build_system_prompt(context_text: str) -> str:
@@ -531,11 +547,26 @@ def get_data_context(subject_choice, subjects):
 def render_chatbot_sidebar(subject_choice, subjects):
     """Render the AI Assistant chat panel in the sidebar."""
     st.sidebar.markdown("---")
-    with st.sidebar.expander("🤖 AI Assistant (Qwen)", expanded=st.session_state.get("chat_open", False)):
-        if not OLLAMA_AVAILABLE:
-            st.error("Install the `ollama` Python package: `pip install ollama`")
-            return
+    st.sidebar.markdown("### 🤖 AI Assistant")
 
+    if not OLLAMA_AVAILABLE:
+        st.sidebar.error("Install the `ollama` Python package: `pip install ollama`")
+        return
+
+    # Set custom OLLAMA_HOST if defined in st.secrets or environment
+    if hasattr(st, "secrets") and "OLLAMA_HOST" in st.secrets:
+        os.environ["OLLAMA_HOST"] = st.secrets["OLLAMA_HOST"]
+
+    available_models = get_available_models()
+    selected_model = st.sidebar.selectbox(
+        "Select Model",
+        available_models,
+        index=0,
+        key="selected_ollama_model",
+        help="Select local Ollama model for chatbot"
+    )
+
+    with st.sidebar.expander(f"💬 Chat with {selected_model}", expanded=st.session_state.get("chat_open", False)):
         # --- initialise session state ---
         if "chat_messages" not in st.session_state:
             st.session_state.chat_messages = []
@@ -604,7 +635,7 @@ def render_chatbot_sidebar(subject_choice, subjects):
                     full_response = ""
                     try:
                         stream = ollama.chat(
-                            model=OLLAMA_MODEL,
+                            model=selected_model,
                             messages=messages_for_ollama,
                             stream=True,
                         )
@@ -614,7 +645,7 @@ def render_chatbot_sidebar(subject_choice, subjects):
                             response_placeholder.markdown(full_response + "▌")
                         response_placeholder.markdown(full_response)
                     except Exception as e:
-                        full_response = f"⚠️ Error talking to Ollama: `{e}`\n\nMake sure Ollama is running and the model `{OLLAMA_MODEL}` is available (`ollama pull {OLLAMA_MODEL}`)."
+                        full_response = f"⚠️ Error talking to Ollama: `{e}`\n\nMake sure Ollama is running and the model `{selected_model}` is available (`ollama pull {selected_model}`)."
                         response_placeholder.error(full_response)
 
             st.session_state.chat_messages.append({"role": "assistant", "content": full_response})
