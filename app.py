@@ -557,6 +557,19 @@ def render_chatbot_sidebar(subject_choice, subjects):
     if hasattr(st, "secrets") and "OLLAMA_HOST" in st.secrets:
         os.environ["OLLAMA_HOST"] = st.secrets["OLLAMA_HOST"]
 
+    # Optional Connection Settings for Streamlit Cloud / custom endpoint
+    with st.sidebar.expander("⚙️ Ollama Connection Settings"):
+        st.caption("Streamlit Cloud runs remotely on AWS/GCP and cannot reach your computer's `localhost` directly.")
+        custom_url = st.text_input(
+            "Ollama Host URL",
+            value=os.environ.get("OLLAMA_HOST", ""),
+            placeholder="e.g. https://xxxx.ngrok-free.app",
+            key="custom_ollama_host_input",
+            help="Enter ngrok or tunnel URL to link Streamlit Cloud to your local computer's Ollama models."
+        )
+        if custom_url.strip():
+            os.environ["OLLAMA_HOST"] = custom_url.strip()
+
     available_models = get_available_models()
     selected_model = st.sidebar.selectbox(
         "Select Model",
@@ -645,7 +658,15 @@ def render_chatbot_sidebar(subject_choice, subjects):
                             response_placeholder.markdown(full_response + "▌")
                         response_placeholder.markdown(full_response)
                     except Exception as e:
-                        full_response = f"⚠️ Error talking to Ollama: `{e}`\n\nMake sure Ollama is running and the model `{selected_model}` is available (`ollama pull {selected_model}`)."
+                        err_str = str(e)
+                        if "Connection refused" in err_str or "111" in err_str or "ConnectError" in err_str:
+                            full_response = (
+                                f"⚠️ **Ollama Connection Refused**\n\n"
+                                f"• **If using Streamlit Cloud (`mouse-data-analysis.streamlit.app`)**: Streamlit Cloud runs on a remote server and cannot access `localhost` on your laptop directly. You can paste an ngrok tunnel URL (`ngrok http 11434`) under **⚙️ Ollama Connection Settings** in the sidebar to connect it to your Mac, or run the app locally on your computer (`http://localhost:8502`).\n\n"
+                                f"• **If running locally (`http://localhost:8502`)**: Make sure your local Ollama app is running on your Mac (`ollama serve`)."
+                            )
+                        else:
+                            full_response = f"⚠️ Error talking to Ollama: `{e}`\n\nMake sure Ollama is running and model `{selected_model}` is available (`ollama pull {selected_model}`)."
                         response_placeholder.error(full_response)
 
             st.session_state.chat_messages.append({"role": "assistant", "content": full_response})
