@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / tooling
+.claude/
+
+# Streamlit local secrets (never commit credentials)
+.streamlit/secrets.toml

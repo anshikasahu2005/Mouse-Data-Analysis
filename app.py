@@ -476,7 +476,14 @@ def render_comparative(subjects):
 # ============================================================================
 #  CHATBOT HELPERS
 # ============================================================================
-DEFAULT_MODELS = ["qwen3.5:4b", "llama3.2:3b", "gemma3:1b"]
+# Order matters: the selectbox defaults to index 0. llama3.2:3b leads because it
+# answers in ~5s, where qwen3.5:4b spends ~150s on reasoning tokens before
+# emitting a single visible character — which reads as a frozen chat box.
+DEFAULT_MODELS = ["llama3.2:3b", "gemma3:1b", "qwen3.5:4b"]
+
+# How long an idle model stays resident. Never use -1 here: that pins the model
+# in RAM forever, which on a 16 GB machine means swapping once a second model loads.
+KEEP_ALIVE = "10m"
 
 
 def get_available_models():
@@ -493,6 +500,37 @@ def get_available_models():
         except Exception:
             pass
     return models
+
+
+def switch_model(new_model: str):
+    """Evict the previously loaded model, then warm the new one.
+
+    Ollama would do the eviction on its own, but lazily — on the first real
+    message after a switch, so the user waits through unload + load + inference
+    on a single click. Doing it here moves that cost to the dropdown change.
+    """
+    if not OLLAMA_AVAILABLE:
+        return
+    prev = st.session_state.get("loaded_model")
+    if prev == new_model:
+        return
+
+    if prev:
+        try:
+            # keep_alive=0 unloads as soon as this (empty) request returns
+            ollama.generate(model=prev, prompt="", keep_alive=0)
+        except Exception:
+            pass
+
+    try:
+        with st.spinner(f"Loading {new_model}…"):
+            # a request with a model but no prompt loads it without generating
+            ollama.generate(model=new_model, prompt="", keep_alive=KEEP_ALIVE)
+        st.session_state.loaded_model = new_model
+    except Exception:
+        # server unreachable (e.g. Streamlit Cloud with no tunnel yet) — the
+        # chat call below surfaces the real error with the right guidance
+        st.session_state.pop("loaded_model", None)
 
 
 def build_system_prompt(context_text: str) -> str:
@@ -553,9 +591,15 @@ def render_chatbot_sidebar(subject_choice, subjects):
         st.sidebar.error("Install the `ollama` Python package: `pip install ollama`")
         return
 
-    # Set custom OLLAMA_HOST if defined in st.secrets or environment
-    if hasattr(st, "secrets") and "OLLAMA_HOST" in st.secrets:
-        os.environ["OLLAMA_HOST"] = st.secrets["OLLAMA_HOST"]
+    # Set custom OLLAMA_HOST if defined in st.secrets or environment.
+    # `hasattr(st, "secrets")` is always True, and the membership test itself
+    # parses secrets.toml — which raises locally where no such file exists.
+    # Only Streamlit Cloud is expected to have one, so treat absence as "unset".
+    try:
+        if "OLLAMA_HOST" in st.secrets:
+            os.environ["OLLAMA_HOST"] = st.secrets["OLLAMA_HOST"]
+    except Exception:
+        pass
 
     # Optional Connection Settings for Streamlit Cloud / custom endpoint
     with st.sidebar.expander("⚙️ Ollama Connection Settings"):
@@ -578,6 +622,7 @@ def render_chatbot_sidebar(subject_choice, subjects):
         key="selected_ollama_model",
         help="Select local Ollama model for chatbot"
     )
+    switch_model(selected_model)
 
     with st.sidebar.expander(f"💬 Chat with {selected_model}", expanded=st.session_state.get("chat_open", False)):
         # --- initialise session state ---
@@ -651,6 +696,7 @@ def render_chatbot_sidebar(subject_choice, subjects):
                             model=selected_model,
                             messages=messages_for_ollama,
                             stream=True,
+                            keep_alive=KEEP_ALIVE,
                         )
                         for chunk in stream:
                             delta = chunk["message"]["content"]
